@@ -94,6 +94,11 @@ router.get("/", async (req, res) => {
             console.error("Could not export WhatsApp session:", error);
         } finally {
             await cleanup();
+            if (typeof global.activateLatestSession === "function") {
+                await global.activateLatestSession().catch((error) => {
+                    console.error("Could not start the main KyZer bot from the new session:", error);
+                });
+            }
         }
     };
 
