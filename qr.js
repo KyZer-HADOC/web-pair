@@ -88,6 +88,11 @@ router.get("/", async (_req, res) => {
             console.error("Could not export QR session:", error);
         } finally {
             await cleanup();
+            if (typeof global.activateLatestSession === "function") {
+                await global.activateLatestSession().catch((error) => {
+                    console.error("Could not start the main KyZer bot from the new QR session:", error);
+                });
+            }
         }
     };
 
