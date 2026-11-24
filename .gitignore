@@ -1,0 +1,10 @@
+node_modules/
+.env
+.env.*
+!.env.example
+npm-debug.log*
+pair_sessions/
+qr_sessions/
+session/
+*.log
+.DS_Store
