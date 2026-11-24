@@ -1,6 +1,7 @@
-
 import express from "express";
-import fs from "fs";
+import fs from "node:fs";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
 import pino from "pino";
 import {
     makeWASocket,
@@ -12,232 +13,182 @@ import {
     fetchLatestBaileysVersion,
 } from "@whiskeysockets/baileys";
 import QRCode from "qrcode";
-import { upload } from "./mega.js";
+import { uploadSessionFolder } from "./mega.js";
 
 const router = express.Router();
+const sessionsRoot = path.resolve("qr_sessions");
+const hasMegaCredentials = () => Boolean(process.env.MEGA_EMAIL && process.env.MEGA_PASSWORD);
 
-function removeFile(FilePath) {
+function removeFile(filePath) {
     try {
-        if (!fs.existsSync(FilePath)) return false;
-        fs.rmSync(FilePath, { recursive: true, force: true });
-    } catch (e) {
-        console.error("Error removing file:", e);
+        fs.rmSync(filePath, { recursive: true, force: true });
+    } catch (error) {
+        console.error("Could not clean QR session:", error.message);
     }
 }
 
 function getMegaFileId(url) {
-    try {
-        const match = url.match(/\/file\/([^#]+#[^\/]+)/);
-        return match ? match[1] : null;
-    } catch (error) {
-        return null;
-    }
+    if (typeof url !== "string") return null;
+    const modern = url.match(/\/file\/([^#/?]+)#([^/?]+)/);
+    if (modern) return `${modern[1]}#${modern[2]}`;
+    const legacy = url.match(/#!([^!/?]+)!([^&/?]+)/);
+    return legacy ? `${legacy[1]}#${legacy[2]}` : null;
 }
 
-router.get("/", async (req, res) => {
-    const sessionId =
-        Date.now().toString() + Math.random().toString(36).substr(2, 9);
-    const dirs = `./qr_sessions/session_${sessionId}`;
-
-    if (!fs.existsSync("./qr_sessions")) {
-        fs.mkdirSync("./qr_sessions", { recursive: true });
+router.get("/", async (_req, res) => {
+    if (!hasMegaCredentials()) {
+        return res.status(503).json({
+            code: "Session storage is not configured. Set MEGA_EMAIL and MEGA_PASSWORD.",
+        });
     }
 
-    await removeFile(dirs);
+    const sessionId = randomUUID();
+    const sessionDir = path.join(sessionsRoot, `session_${sessionId}`);
+    let socket = null;
+    let responseSent = false;
+    let completed = false;
+    let cleaned = false;
+    let timeout;
 
-    async function initiateSession() {
-        const { state, saveCreds } = await useMultiFileAuthState(dirs);
+    const cleanup = async () => {
+        if (cleaned) return;
+        cleaned = true;
+        clearTimeout(timeout);
+        try {
+            socket?.ev?.removeAllListeners();
+            socket?.end?.(new Error("QR pairing flow finished"));
+        } catch {}
+        await delay(300);
+        removeFile(sessionDir);
+    };
+
+    const finishPairing = async () => {
+        if (completed) return;
+        completed = true;
 
         try {
-            const { version, isLatest } = await fetchLatestBaileysVersion();
+            console.log("WhatsApp paired with QR. Uploading complete multi-file session to MEGA...");
+            const megaUrl = await uploadSessionFolder(
+                sessionDir,
+                `kyzer_qr_session_${Date.now()}.json`,
+            );
+            const megaFileId = getMegaFileId(megaUrl);
+            if (!megaFileId) throw new Error("MEGA did not return a supported file link.");
 
-            let responseSent = false;
+            const userId = socket.authState.creds.me?.id || "";
+            const number = userId.split("@")[0].split(":")[0];
+            if (!number) throw new Error("Could not determine the paired WhatsApp account.");
 
-            const KnightBot = makeWASocket({
-                version,
-                auth: {
-                    creds: state.creds,
-                    keys: makeCacheableSignalKeyStore(
-                        state.keys,
-                        pino({ level: "fatal" }).child({ level: "fatal" }),
-                    ),
-                },
-                printQRInTerminal: false,
-                logger: pino({ level: "fatal" }).child({ level: "fatal" }),
-                browser: Browsers.windows("Chrome"),
-                markOnlineOnConnect: false,
-                generateHighQualityLinkPreview: false,
-                defaultQueryTimeoutMs: 60000,
-                connectTimeoutMs: 60000,
-                keepAliveIntervalMs: 30000,
-                retryRequestDelayMs: 250,
-                maxRetries: 5,
-            });
+            await socket.sendMessage(
+                jidNormalizedUser(`${number}@s.whatsapp.net`),
+                { text: megaFileId },
+            );
+            console.log("Session bundle sent to the paired WhatsApp account.");
+        } catch (error) {
+            console.error("Could not export QR session:", error);
+        } finally {
+            await cleanup();
+        }
+    };
 
-            KnightBot.ev.on("connection.update", async (update) => {
-                const { connection, lastDisconnect, isNewLogin, isOnline, qr } =
-                    update;
+    const startSession = async () => {
+        const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+        const { version } = await fetchLatestBaileysVersion();
 
-                if (qr && !responseSent) {
-                    console.log(
-                        "🟢 QR Code Generated! Scan it with your WhatsApp app.",
-                    );
+        socket = makeWASocket({
+            version,
+            auth: {
+                creds: state.creds,
+                keys: makeCacheableSignalKeyStore(
+                    state.keys,
+                    pino({ level: "fatal" }).child({ level: "fatal" }),
+                ),
+            },
+            printQRInTerminal: false,
+            logger: pino({ level: "fatal" }).child({ level: "fatal" }),
+            browser: Browsers.windows("Chrome"),
+            markOnlineOnConnect: false,
+            generateHighQualityLinkPreview: false,
+            defaultQueryTimeoutMs: 60000,
+            connectTimeoutMs: 60000,
+            keepAliveIntervalMs: 30000,
+            retryRequestDelayMs: 250,
+            maxRetries: 5,
+        });
 
-                    try {
-                        const qrDataURL = await QRCode.toDataURL(qr, {
-                            errorCorrectionLevel: "M",
-                            type: "image/png",
-                            quality: 0.92,
-                            margin: 1,
-                            color: {
-                                dark: "#000000",
-                                light: "#FFFFFF",
-                            },
+        socket.ev.on("creds.update", saveCreds);
+        socket.ev.on("connection.update", async (update) => {
+            const { connection, lastDisconnect, qr } = update;
+
+            if (qr && !responseSent && !cleaned) {
+                try {
+                    const qrDataURL = await QRCode.toDataURL(qr, {
+                        errorCorrectionLevel: "M",
+                        type: "image/png",
+                        quality: 0.92,
+                        margin: 1,
+                        color: { dark: "#000000", light: "#FFFFFF" },
+                    });
+                    if (!responseSent && !cleaned) {
+                        responseSent = true;
+                        res.json({
+                            qr: qrDataURL,
+                            message: "QR code generated. Scan it with WhatsApp.",
+                            instructions: [
+                                "1. Open WhatsApp on your phone",
+                                "2. Go to Settings > Linked Devices",
+                                '3. Tap "Link a Device"',
+                                "4. Scan the QR code above",
+                            ],
                         });
-
-                        if (!responseSent) {
-                            responseSent = true;
-                            console.log("QR Code sent to client");
-                            res.send({
-                                qr: qrDataURL,
-                                message:
-                                    "QR Code Generated! Scan it with your WhatsApp app.",
-                                instructions: [
-                                    "1. Open WhatsApp on your phone",
-                                    "2. Go to Settings > Linked Devices",
-                                    '3. Tap "Link a Device"',
-                                    "4. Scan the QR code above",
-                                ],
-                            });
-                        }
-                    } catch (qrError) {
-                        console.error("Error generating QR code:", qrError);
-                        if (!responseSent) {
-                            responseSent = true;
-                            res.status(500).send({
-                                code: "Failed to generate QR code",
-                            });
-                        }
                     }
-                }
-
-                if (connection === "open") {
-                    console.log("✅ Connected successfully!");
-                    console.log("📱 Uploading session to MEGA...");
-
-                    try {
-                        const credsPath = dirs + "/creds.json";
-                        const megaUrl = await upload(
-                            credsPath,
-                            `creds_qr_${sessionId}.json`,
-                        );
-                        const megaFileId = getMegaFileId(megaUrl);
-
-                        if (megaFileId) {
-                            console.log(
-                                "✅ Session uploaded to MEGA. File ID:",
-                                megaFileId,
-                            );
-
-                            const userJid = jidNormalizedUser(
-                                KnightBot.authState.creds.me?.id || "",
-                            );
-                            if (userJid) {
-                                await KnightBot.sendMessage(userJid, {
-                                    text: `${megaFileId}`,
-                                });
-                                console.log(
-                                    "📄 MEGA file ID sent successfully",
-                                );
-                            } else {
-                                console.log("❌ Could not determine user JID");
-                            }
-                        } else {
-                            console.log("❌ Failed to upload to MEGA");
-                        }
-
-                        console.log("🧹 Cleaning up session...");
-                        await delay(1000);
-                        removeFile(dirs);
-                        console.log("✅ Session cleaned up successfully");
-                        console.log("🎉 Process completed successfully!");
-
-                        console.log("🛑 Shutting down application...");
-                        await delay(2000);
-                        process.exit(0);
-                    } catch (error) {
-                        console.error("❌ Error uploading to MEGA:", error);
-                        removeFile(dirs);
-                        await delay(2000);
-                        process.exit(1);
+                } catch (error) {
+                    console.error("QR image generation failed:", error);
+                    if (!responseSent) {
+                        responseSent = true;
+                        res.status(500).json({ code: "Failed to generate QR code." });
                     }
+                    await cleanup();
                 }
+            }
 
-                if (isNewLogin) {
-                    console.log("🔐 New login via QR code");
-                }
+            if (connection === "open") {
+                await finishPairing();
+                return;
+            }
 
-                if (isOnline) {
-                    console.log("📶 Client is online");
-                }
-
-                if (connection === "close") {
-                    const statusCode =
-                        lastDisconnect?.error?.output?.statusCode;
-
-                    if (statusCode === 401) {
-                        console.log(
-                            "❌ Logged out from WhatsApp. Need to generate new QR code.",
-                        );
-                    } else {
-                        console.log("🔁 Connection closed — restarting...");
-                        initiateSession();
-                    }
-                }
-            });
-
-            KnightBot.ev.on("creds.update", saveCreds);
-
-            setTimeout(() => {
+            if (connection === "close" && !completed) {
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                console.log(`QR pairing socket closed (status ${statusCode ?? "unknown"}).`);
                 if (!responseSent) {
                     responseSent = true;
-                    res.status(408).send({ code: "QR generation timeout" });
-                    removeFile(dirs);
-                    setTimeout(() => process.exit(1), 2000);
+                    res.status(503).json({ code: "QR session closed. Please generate a new QR code." });
                 }
-            }, 30000);
-        } catch (err) {
-            console.error("Error initializing session:", err);
-            if (!res.headersSent) {
-                res.status(503).send({ code: "Service Unavailable" });
+                await cleanup();
             }
-            removeFile(dirs);
-            setTimeout(() => process.exit(1), 2000);
+        });
+    };
+
+    fs.mkdirSync(sessionsRoot, { recursive: true });
+    fs.mkdirSync(sessionDir, { recursive: true });
+    timeout = setTimeout(async () => {
+        if (!responseSent) {
+            responseSent = true;
+            res.status(408).json({ code: "QR session timed out. Please generate a new QR code." });
         }
+        await cleanup();
+    }, 5 * 60 * 1000);
+
+    try {
+        await startSession();
+    } catch (error) {
+        console.error("QR session initialization failed:", error);
+        if (!responseSent) {
+            responseSent = true;
+            res.status(503).json({ code: "QR service unavailable." });
+        }
+        await cleanup();
     }
-
-    await initiateSession();
-});
-
-process.on("uncaughtException", (err) => {
-    let e = String(err);
-    if (e.includes("conflict")) return;
-    if (e.includes("not-authorized")) return;
-    if (e.includes("Socket connection timeout")) return;
-    if (e.includes("rate-overlimit")) return;
-    if (e.includes("Connection Closed")) return;
-    if (e.includes("Timed Out")) return;
-    if (e.includes("Value not found")) return;
-    if (
-        e.includes("Stream Errored") ||
-        e.includes("Stream Errored (restart required)")
-    )
-        return;
-    if (e.includes("statusCode: 515") || e.includes("statusCode: 503")) return;
-    console.log("Caught exception: ", err);
-    process.exit(1);
 });
 
 export default router;
-
-  
