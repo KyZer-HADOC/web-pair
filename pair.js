@@ -1,5 +1,7 @@
 import express from "express";
-import fs from "fs";
+import fs from "node:fs";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
 import pino from "pino";
 import {
     makeWASocket,
@@ -11,234 +13,191 @@ import {
     fetchLatestBaileysVersion,
 } from "@whiskeysockets/baileys";
 import pn from "awesome-phonenumber";
-import { upload } from "./mega.js";
+import { uploadSessionFolder } from "./mega.js";
 
 const router = express.Router();
+const sessionsRoot = path.resolve("pair_sessions");
+const hasMegaCredentials = () => Boolean(process.env.MEGA_EMAIL && process.env.MEGA_PASSWORD);
 
-function removeFile(FilePath) {
+function removeFile(filePath) {
     try {
-        if (!fs.existsSync(FilePath)) return false;
-        fs.rmSync(FilePath, { recursive: true, force: true });
-    } catch (e) {
-        console.error("Error removing file:", e);
+        fs.rmSync(filePath, { recursive: true, force: true });
+    } catch (error) {
+        console.error("Could not clean pairing session:", error.message);
     }
 }
 
 function getMegaFileId(url) {
-    try {
-        // Extract everything after /file/ including the key
-        const match = url.match(/\/file\/([^#]+#[^\/]+)/);
-        return match ? match[1] : null;
-    } catch (error) {
-        return null;
-    }
+    if (typeof url !== "string") return null;
+    const modern = url.match(/\/file\/([^#/?]+)#([^/?]+)/);
+    if (modern) return `${modern[1]}#${modern[2]}`;
+    const legacy = url.match(/#!([^!/?]+)!([^&/?]+)/);
+    return legacy ? `${legacy[1]}#${legacy[2]}` : null;
 }
 
 router.get("/", async (req, res) => {
-    let num = req.query.number;
-    let dirs = "./" + (num || `session`);
-
-    await removeFile(dirs);
-
-    num = num.replace(/[^0-9]/g, "");
-
-    const phone = pn("+" + num);
-    if (!phone.isValid()) {
-        if (!res.headersSent) {
-            return res.status(400).send({
-                code: "Invalid phone number. Please enter your full international number (e.g., 15551234567 for US, 447911123456 for UK, 84987654321 for Vietnam, etc.) without + or spaces.",
-            });
-        }
-        return;
+    if (!hasMegaCredentials()) {
+        return res.status(503).json({
+            code: "Session storage is not configured. Set MEGA_EMAIL and MEGA_PASSWORD.",
+        });
     }
-    num = phone.getNumber("e164").replace("+", "");
 
-    let currentSocket = null;
-    let restartAttempts = 0;
-    const MAX_RESTART_ATTEMPTS = 5;
+    const rawNumber = typeof req.query.number === "string" ? req.query.number : "";
+    const digits = rawNumber.replace(/\D/g, "");
+    if (!digits || digits.length > 15) {
+        return res.status(400).json({ code: "Enter a valid international WhatsApp number." });
+    }
 
-    async function initiateSession() {
-        const { state, saveCreds } = await useMultiFileAuthState(dirs);
+    const phone = pn(`+${digits}`);
+    if (!phone.isValid()) {
+        return res.status(400).json({
+            code: "Invalid phone number. Enter the full international number including country code.",
+        });
+    }
 
+    const number = phone.getNumber("e164").replace("+", "");
+    const sessionDir = path.join(sessionsRoot, `${number}_${randomUUID()}`);
+    let socket = null;
+    let completed = false;
+    let cleaned = false;
+    let attempts = 0;
+    let timeout;
+
+    const cleanup = async () => {
+        if (cleaned) return;
+        cleaned = true;
+        clearTimeout(timeout);
         try {
-            const { version, isLatest } = await fetchLatestBaileysVersion();
-            let KnightBot = makeWASocket({
-                version,
-                auth: {
-                    creds: state.creds,
-                    keys: makeCacheableSignalKeyStore(
-                        state.keys,
-                        pino({ level: "fatal" }).child({ level: "fatal" }),
-                    ),
-                },
-                printQRInTerminal: false,
-                logger: pino({ level: "fatal" }).child({ level: "fatal" }),
-                browser: Browsers.windows("Chrome"),
-                markOnlineOnConnect: false,
-                generateHighQualityLinkPreview: false,
-                defaultQueryTimeoutMs: 60000,
-                connectTimeoutMs: 60000,
-                keepAliveIntervalMs: 30000,
-                retryRequestDelayMs: 250,
-                maxRetries: 5,
-            });
+            socket?.ev?.removeAllListeners();
+            socket?.end?.(new Error("Pairing flow finished"));
+        } catch {}
+        await delay(300);
+        removeFile(sessionDir);
+    };
 
-            currentSocket = KnightBot;
+    const saveSession = async () => {
+        if (completed) return;
+        completed = true;
+        try {
+            console.log("WhatsApp paired. Uploading complete multi-file session to MEGA...");
+            const megaUrl = await uploadSessionFolder(
+                sessionDir,
+                `kyzer_session_${number}_${Date.now()}.json`,
+            );
+            const sessionId = getMegaFileId(megaUrl);
+            if (!sessionId) throw new Error("MEGA did not return a supported file link.");
 
-            KnightBot.ev.on("connection.update", async (update) => {
-                const { connection, lastDisconnect, isNewLogin, isOnline } =
-                    update;
+            const userJid = jidNormalizedUser(`${number}@s.whatsapp.net`);
+            await socket.sendMessage(userJid, { text: sessionId });
+            console.log("Session bundle sent to the paired WhatsApp account.");
+        } catch (error) {
+            console.error("Could not export WhatsApp session:", error);
+        } finally {
+            await cleanup();
+        }
+    };
 
-                if (connection === "open") {
-                    console.log("✅ Connected successfully!");
-                    restartAttempts = 0;
-                    console.log("📱 Uploading session to MEGA...");
+    const initiateSession = async () => {
+        const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+        const { version } = await fetchLatestBaileysVersion();
 
-                    try {
-                        const credsPath = dirs + "/creds.json";
-                        const megaUrl = await upload(
-                            credsPath,
-                            `creds_${num}_${Date.now()}.json`,
-                        );
-                        const megaFileId = getMegaFileId(megaUrl);
+        socket = makeWASocket({
+            version,
+            auth: {
+                creds: state.creds,
+                keys: makeCacheableSignalKeyStore(
+                    state.keys,
+                    pino({ level: "fatal" }).child({ level: "fatal" }),
+                ),
+            },
+            printQRInTerminal: false,
+            logger: pino({ level: "fatal" }).child({ level: "fatal" }),
+            browser: Browsers.windows("Chrome"),
+            markOnlineOnConnect: false,
+            generateHighQualityLinkPreview: false,
+            defaultQueryTimeoutMs: 60000,
+            connectTimeoutMs: 60000,
+            keepAliveIntervalMs: 30000,
+            retryRequestDelayMs: 250,
+            maxRetries: 5,
+        });
 
-                        if (megaFileId) {
-                            console.log(
-                                "✅ Session uploaded to MEGA. File ID:",
-                                megaFileId,
-                            );
+        socket.ev.on("creds.update", saveCreds);
+        socket.ev.on("connection.update", async (update) => {
+            const { connection, lastDisconnect } = update;
 
-                            const userJid = jidNormalizedUser(
-                                num + "@s.whatsapp.net",
-                            );
-                            await KnightBot.sendMessage(userJid, {
-                                text: `${megaFileId}`,
-                            });
-                            console.log("📄 MEGA file ID sent successfully");
-                        } else {
-                            console.log("❌ Failed to upload to MEGA");
-                        }
+            if (connection === "open") {
+                await saveSession();
+                return;
+            }
 
-                        console.log("🧹 Cleaning up session...");
-                        await delay(1000);
-                        removeFile(dirs);
-                        console.log("✅ Session cleaned up successfully");
-                        console.log("🎉 Process completed successfully!");
-
-                        console.log("🛑 Shutting down application...");
-                        await delay(2000);
-                        process.exit(0);
-                    } catch (error) {
-                        console.error("❌ Error uploading to MEGA:", error);
-                        removeFile(dirs);
-                        await delay(2000);
-                        process.exit(1);
-                    }
+            if (connection === "close" && !completed) {
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                if (statusCode === 401) {
+                    console.log("WhatsApp rejected the pairing session. Generate a fresh code.");
+                    await cleanup();
+                    return;
                 }
 
-                if (isNewLogin) {
-                    console.log("🔐 New login via pair code");
+                attempts += 1;
+                if (attempts > 3) {
+                    console.error("Pairing socket could not reconnect; ending this request.");
+                    await cleanup();
+                    return;
                 }
 
-                if (isOnline) {
-                    console.log("📶 Client is online");
-                }
-
-                if (connection === "close") {
-                    const statusCode =
-                        lastDisconnect?.error?.output?.statusCode;
-
-                    if (statusCode === 401) {
-                        console.log(
-                            "❌ Logged out from WhatsApp. Need to generate new pair code.",
-                        );
-                        removeFile(dirs);
-                        return;
-                    }
-
-                    restartAttempts++;
-                    if (restartAttempts > MAX_RESTART_ATTEMPTS) {
-                        console.log(
-                            `❌ Reached max restart attempts (${MAX_RESTART_ATTEMPTS}). Giving up — likely a network/IP block issue.`,
-                        );
-                        removeFile(dirs);
-                        await delay(1000);
-                        process.exit(1);
-                        return;
-                    }
-
-                    // Make sure the old socket is fully torn down before opening a new one,
-                    // otherwise WhatsApp sees two simultaneous connections for the same
-                    // session and force-closes one as a "conflict" — which is what was
-                    // causing the device to flicker between Active/Last Active.
-                    try {
-                        KnightBot.ev.removeAllListeners();
-                        KnightBot.end?.(undefined);
-                    } catch (e) {
-                        // ignore cleanup errors
-                    }
-
-                    const backoff = Math.min(15000, 2000 * restartAttempts);
-                    console.log(
-                        `🔁 Connection closed (status ${statusCode}) — restarting in ${backoff / 1000}s (attempt ${restartAttempts}/${MAX_RESTART_ATTEMPTS})...`,
-                    );
-                    setTimeout(() => initiateSession(), backoff);
-                }
-            });
-
-            if (!KnightBot.authState.creds.registered) {
-                await delay(3000); // Wait 3 seconds before requesting pairing code
-                num = num.replace(/[^\d+]/g, "");
-                if (num.startsWith("+")) num = num.substring(1);
-
+                const waitMs = Math.min(10000, 2000 * attempts);
+                console.log(`Pairing socket closed. Reconnecting in ${waitMs / 1000}s...`);
                 try {
-                    let code = await KnightBot.requestPairingCode(num);
-                    code = code?.match(/.{1,4}/g)?.join("-") || code;
-                    if (!res.headersSent) {
-                        console.log({ num, code });
-                        await res.send({ code });
-                    }
-                } catch (error) {
-                    console.error("Error requesting pairing code:", error);
-                    if (!res.headersSent) {
-                        res.status(503).send({
-                            code: "Failed to get pairing code. Please check your phone number and try again.",
+                    socket.ev.removeAllListeners();
+                    socket.end?.(new Error("Reconnecting pairing socket"));
+                } catch {}
+                setTimeout(() => {
+                    if (!cleaned && !completed) {
+                        initiateSession().catch(async (error) => {
+                            console.error("Pairing reconnect failed:", error);
+                            if (!res.headersSent) {
+                                res.status(503).json({ code: "Pairing service unavailable." });
+                            }
+                            await cleanup();
                         });
                     }
-                    setTimeout(() => process.exit(1), 2000);
-                }
+                }, waitMs);
             }
+        });
 
-            KnightBot.ev.on("creds.update", saveCreds);
-        } catch (err) {
-            console.error("Error initializing session:", err);
+        if (!socket.authState.creds.registered) {
+            await delay(2500);
+            const code = await socket.requestPairingCode(number);
+            const formattedCode = code?.match(/.{1,4}/g)?.join("-") || code;
+            if (!res.headersSent && !cleaned) {
+                res.json({ code: formattedCode });
+            }
+        } else {
             if (!res.headersSent) {
-                res.status(503).send({ code: "Service Unavailable" });
+                res.status(409).json({ code: "This session is already registered. Generate a new session instead." });
             }
-            setTimeout(() => process.exit(1), 2000);
         }
+    };
+
+    fs.mkdirSync(sessionsRoot, { recursive: true });
+    fs.mkdirSync(sessionDir, { recursive: true });
+    timeout = setTimeout(async () => {
+        if (!res.headersSent) {
+            res.status(408).json({ code: "Pairing timed out. Please generate a new code." });
+        }
+        await cleanup();
+    }, 5 * 60 * 1000);
+
+    try {
+        await initiateSession();
+    } catch (error) {
+        console.error("Pair-code generation failed:", error);
+        if (!res.headersSent) {
+            res.status(503).json({ code: "Could not generate a pairing code. Please try again." });
+        }
+        await cleanup();
     }
-
-    await initiateSession();
-});
-
-process.on("uncaughtException", (err) => {
-    let e = String(err);
-    if (e.includes("conflict")) return;
-    if (e.includes("not-authorized")) return;
-    if (e.includes("Socket connection timeout")) return;
-    if (e.includes("rate-overlimit")) return;
-    if (e.includes("Connection Closed")) return;
-    if (e.includes("Timed Out")) return;
-    if (e.includes("Value not found")) return;
-    if (
-        e.includes("Stream Errored") ||
-        e.includes("Stream Errored (restart required)")
-    )
-        return;
-    if (e.includes("statusCode: 515") || e.includes("statusCode: 503")) return;
-    console.log("Caught exception: ", err);
-    process.exit(1);
 });
 
 export default router;
